@@ -328,11 +328,13 @@ function genHorses(){
   const raw = Array.from({length:N_HORSES}, () => Math.exp(randn()));
   const sum = raw.reduce((a,b)=>a+b, 0);
   const names = genNames(N_HORSES);
-  return raw.map((s,i) => {
+  const horses = raw.map((s,i) => {
     const p = s / sum;
-    const noisy = (0.8 / p) * (0.9 + Math.random()*0.2);
-    return { num:i+1, name:names[i], p, refOdds: Math.max(1.0, Math.round(noisy*10)/10) };
+    return { num:i+1, name:names[i], p, refOdds: oddsFromProb(p) };
   });
+  // 人気 = 単勝オッズ昇順(確率降順)
+  [...horses].sort((a,b)=>b.p-a.p).forEach((h,i)=>{ h.pop = i+1; });
+  return horses;
 }
 function decideOrder(horses){
   const rem = horses.map(h => ({num:h.num, p:h.p}));
@@ -362,48 +364,83 @@ function isHit(bet, order){
   return false;
 }
 
-/* ---------- 清算(パリミュチュエル / キャリーオーバー) ---------- */
-function settle(order, opt){
-  opt = opt || {};
-  const bets  = opt.bets  || S.bets;
-  const carry = opt.carry || S.carry;
-  const raceNo = opt.raceNo || S.raceNo;
-  const info = {};   // type -> {pool, betTotal, hits, per100, carriedNext, refunded}
-  for(const t of TYPE_KEYS){
-    const tb = bets.filter(b => b.type === t);
-    const betTotal = tb.reduce((a,b)=>a+b.amount, 0);
-    const pool = betTotal + (carry[t] || 0);
-    if(pool === 0) continue;
-    const hits = tb.filter(b => isHit(b, order));
-    tb.forEach(b => { b.hit = isHit(b, order); b.payout = 0; b.refund = 0; });
-    if(hits.length){
-      const hitTotal = hits.reduce((a,b)=>a+b.amount, 0);
-      hits.forEach(b => { b.payout = Math.round(pool * b.amount / hitTotal); });
-      info[t] = { pool, betTotal, hits, per100: Math.round(pool / hitTotal * 100), carriedNext:0, refunded:false };
-      carry[t] = 0;
-    } else if(raceNo < N_RACES){
-      carry[t] = pool;
-      info[t] = { pool, betTotal, hits:[], per100:0, carriedNext:pool, refunded:false };
-    } else {
-      if(betTotal > 0) tb.forEach(b => { b.refund = Math.round(pool * b.amount / betTotal); });
-      info[t] = { pool, betTotal, hits:[], per100:0, carriedNext:0, refunded: betTotal > 0 };
-      carry[t] = 0;
+/* ---------- 確率オッズ(固定オッズ・払戻率100%) ---------- */
+function oddsFromProb(pr){ return Math.max(1.1, Math.round(1/pr*10)/10); }
+function probOf(type, sel){
+  const P = {}; S.horses.forEach(h => P[h.num] = h.p);
+  const p2 = (i,j) => P[i] * P[j] / (1 - P[i]);                              // i→j の順
+  const p3 = (i,j,k) => P[i] * (P[j]/(1-P[i])) * (P[k]/(1-P[i]-P[j]));       // i→j→k の順
+  const perm3 = (a,b,c) => p3(a,b,c)+p3(a,c,b)+p3(b,a,c)+p3(b,c,a)+p3(c,a,b)+p3(c,b,a);
+  const s = sel;
+  switch(type){
+    case "tansho":     return P[s[0]];
+    case "umatan":     return p2(s[0], s[1]);
+    case "umaren":     return p2(s[0], s[1]) + p2(s[1], s[0]);
+    case "sanrentan":  return p3(s[0], s[1], s[2]);
+    case "sanrenpuku": return perm3(s[0], s[1], s[2]);
+    case "wide": {
+      let t = 0;
+      S.horses.forEach(h => { if(h.num !== s[0] && h.num !== s[1]) t += perm3(s[0], s[1], h.num); });
+      return t;
+    }
+    case "fukusho": {
+      const i = s[0];
+      let t = P[i];                                                          // 1着
+      S.horses.forEach(hj => {
+        const j = hj.num; if(j === i) return;
+        t += P[j] * P[i] / (1 - P[j]);                                       // 2着
+        S.horses.forEach(hk => {
+          const k = hk.num; if(k === i || k === j) return;
+          t += P[j] * (P[k]/(1-P[j])) * (P[i]/(1-P[j]-P[k]));                // 3着
+        });
+      });
+      return t;
     }
   }
-  return info;
+  return 0;
 }
+function oddsOf(type, sel){ return oddsFromProb(probOf(type, sel)); }
 
-/* ---------- 暫定オッズ ---------- */
-function typePool(type, extra){
-  const all = extra ? S.bets.concat(extra) : S.bets;
-  return (S.carry[type] || 0) + all.filter(b=>b.type===type).reduce((a,b)=>a+b.amount, 0);
-}
-function provOdds(type, sel, extra){
-  const key = comboKey(type, sel);
-  const all = extra ? S.bets.concat(extra) : S.bets;
-  const comboAmt = all.filter(b => comboKey(b.type,b.sel) === key).reduce((a,b)=>a+b.amount, 0);
-  if(comboAmt === 0) return null;
-  return Math.max(1, Math.round(typePool(type, extra) / comboAmt * 10) / 10);
+/* ---------- 清算(固定オッズ + 共通キャリーオーバー) ----------
+   ・的中: 賭け金 × オッズ を払い戻し
+   ・的中者ゼロの券種: その券種の購入総額を共通キャリーへ合算
+   ・レース開始時点のキャリー: そのレースで的中した全票に賭け金比で山分け
+   ・第3レースで的中者ゼロ: 残キャリーを当レース購入者へ購入比で返還       */
+function settle(order, opt){
+  opt = opt || {};
+  const bets   = opt.bets || S.bets;
+  const raceNo = opt.raceNo || S.raceNo;
+  const potIn  = (opt.carryIn !== undefined) ? opt.carryIn : S.carry;
+  const info = { types:{}, potDistributed:0, potRefunded:false, carryNext:0 };
+  const hitsAll = [];
+  for(const t of TYPE_KEYS){
+    const tb = bets.filter(b => b.type === t);
+    if(!tb.length) continue;
+    const total = tb.reduce((a,b)=>a+b.amount, 0);
+    tb.forEach(b => { b.hit = isHit(b, order); b.payout = 0; b.refund = 0; b.carryBonus = 0; });
+    const hits = tb.filter(b => b.hit);
+    hits.forEach(b => { b.payout = Math.round(b.amount * b.odds); });
+    hitsAll.push(...hits);
+    info.types[t] = { total, hits, toPot: hits.length ? 0 : total };
+  }
+  let pot = potIn;
+  if(pot > 0 && hitsAll.length){
+    const hitAmt = hitsAll.reduce((a,b)=>a+b.amount, 0);
+    hitsAll.forEach(b => { b.carryBonus = Math.round(pot * b.amount / hitAmt); });
+    info.potDistributed = pot;
+    pot = 0;
+  }
+  for(const t in info.types){ pot += info.types[t].toPot; }
+  if(raceNo >= N_RACES && pot > 0){
+    const total = bets.reduce((a,b)=>a+b.amount, 0);
+    if(total > 0){
+      bets.forEach(b => { b.refund = (b.refund||0) + Math.round(pot * b.amount / total); });
+      info.potRefunded = true;
+    }
+    pot = 0;
+  }
+  info.carryNext = pot;
+  return info;
 }
 
 /* ---------- 画面ルーター ---------- */
@@ -432,8 +469,8 @@ function renderTitle(){
     <div class="board" style="max-width:420px;width:100%;">
       <div style="font-size:13px;color:var(--dim);text-align:left;line-height:1.9;">
         ・全3レースで最終持ち金を競うパーティーゲーム<br>
-        ・賭け金は全額払い戻し(控除率0%)<br>
-        ・的中者ゼロなら次レースへキャリーオーバー
+        ・オッズは実力(確率)から自動計算の確定倍率。三連単は超高配当<br>
+        ・的中者ゼロの券種の賭け金はキャリーオーバーに合算。次に何かを当てた人たちで山分け
       </div>
     </div>
     <button class="btn btn-primary" style="min-width:220px;font-size:18px;" onclick="go('setup')">
@@ -490,8 +527,7 @@ function startGame(){
     return { name: v || `プレイヤー${i+1}`, money: S.startMoney };
   });
   S.raceNo = 1;
-  S.carry = {};
-  TYPE_KEYS.forEach(t => S.carry[t] = 0);
+  S.carry = 0;
   newRace();
 }
 
@@ -499,25 +535,25 @@ function startGame(){
    画面: 出走表
 ===================================================== */
 function renderEntry(){
-  const carries = TYPE_KEYS.filter(t => S.carry[t] > 0);
   app().innerHTML = `
   <div class="screen">
     <h2 class="scr-title"><span class="rno">第${S.raceNo}レース</span><span class="led">出走表</span><span style="margin-left:auto;font-size:13px;color:var(--dim);">15頭立て</span></h2>
-    ${carries.length ? `<div class="board"><div class="board-title">キャリーオーバー</div>
-      ${carries.map(t=>`<span class="carry-badge">${BET_TYPES[t].label} +${yen(S.carry[t])}</span>`).join("")}
-      <div class="note">前レースで的中者がいなかった分が、このレースの同じ券種の払い戻しに上乗せされます。</div>
+    ${S.carry > 0 ? `<div class="board"><div class="board-title">キャリーオーバー</div>
+      <span class="carry-badge">+${yen(S.carry)}</span>
+      <div class="note">前レースまでの的中者ゼロ分の合算。このレースで何かを的中させた全員に、賭け金の割合で山分けされます。</div>
     </div>` : ""}
     <div class="board">
       <div class="board-title">出走馬</div>
       <table class="tbl">
-        <tr><th>馬番</th><th>馬名</th><th class="td-r">参考オッズ</th></tr>
+        <tr><th>馬番</th><th>人気</th><th>馬名</th><th class="td-r">単勝オッズ</th></tr>
         ${S.horses.map(h=>`<tr>
           <td>${wakuChip(h.num)}</td>
+          <td><span class="num ${h.pop<=3?"led":""}" style="font-weight:bold;">${h.pop}</span><span style="font-size:10px;color:var(--dim);">人気</span></td>
           <td style="font-weight:bold;">${h.name}</td>
           <td class="td-r num led">${h.refOdds.toFixed(1)}</td>
         </tr>`).join("")}
       </table>
-      <div class="note">※参考オッズは予想の目安です。実際の払い戻しは全員の投票額で決まります。</div>
+      <div class="note">※オッズは各馬の実力から算出した確定倍率。的中したら 賭け金×オッズ が払い戻されます。</div>
     </div>
     <div class="board">
       <div class="board-title">持ち金</div>
@@ -568,7 +604,6 @@ function drawBet(){
     return;
   }
   const def = BET_TYPES[B.type];
-  const carry = S.carry[B.type] || 0;
   const slotLabels = ["1着","2着","3着"];
   const nSel = B.sel.length;
   const forceBox = def.ordered && def.picks > 1 && B.boxOn;
@@ -581,12 +616,16 @@ function drawBet(){
       ? "馬をえらんでね(複数えらぶと全頭購入)"
       : `あと${def.picks - nSel}頭えらんでね(多めにえらぶとBOX買い)`;
   } else if(!isBox){
-    selInfo = (def.ordered && def.picks > 1)
+    const od = oddsOf(B.type, combos[0]);
+    selInfo = ((def.ordered && def.picks > 1)
       ? slotLabels.slice(0, def.picks).map((l,i)=>`${l}:<b>${B.sel[i]}</b>`).join("　")
-      : `選択中: <b>${[...B.sel].sort((a,b)=>a-b).join("-")}</b>`;
+      : `選択中: <b>${[...B.sel].sort((a,b)=>a-b).join("-")}</b>`)
+      + `　<span class="led num">${od.toFixed(1)}倍</span>`;
   } else {
+    const os = combos.map(c => oddsOf(B.type, c));
+    const lo = Math.min(...os), hi = Math.max(...os);
     const boxLabel = def.picks === 1 ? `${nSel}頭それぞれ購入` : "BOX買い";
-    selInfo = `<b>${[...B.sel].sort((a,b)=>a-b).join("-")}</b>　<span class="led">${boxLabel} 全${nPts}点</span>`;
+    selInfo = `<b>${[...B.sel].sort((a,b)=>a-b).join("-")}</b>　<span class="led">${boxLabel} 全${nPts}点</span>　<span class="led num">${lo.toFixed(1)}〜${hi.toFixed(1)}倍</span>`;
   }
   const perUnit = Math.max(1, nPts) * UNIT;                 // 1口あたり(全点分)
   const maxUnits = Math.max(1, Math.floor(remainMoney() / perUnit));
@@ -601,14 +640,14 @@ function drawBet(){
       <span style="font-size:12px;color:var(--dim);">第${S.raceNo}R</span>
       <span class="sp num">残り <span class="led">${yen(remainMoney())}</span></span>
     </div>
+    ${S.carry > 0 ? `<div class="board" style="padding:8px 12px;"><span class="carry-badge">キャリーオーバー +${yen(S.carry)}</span><span style="font-size:12px;color:var(--dim);"> このレースの的中者全員で山分け</span></div>` : ""}
 
     <div class="board">
       <div class="board-title">券種をえらぶ</div>
       <div class="tabs">
         ${TYPE_KEYS.map(t=>`<button class="tab ${t===B.type?"on":""}" onclick="setBetType('${t}')">${BET_TYPES[t].label}</button>`).join("")}
       </div>
-      <div style="font-size:12px;color:var(--dim);">${def.label}: ${def.hint}
-        ${carry>0?`<span class="carry-badge">キャリー +${yen(carry)}</span>`:""}</div>
+      <div style="font-size:12px;color:var(--dim);">${def.label}: ${def.hint}</div>
     </div>
 
     <div class="board">
@@ -622,8 +661,8 @@ function drawBet(){
           return `<button class="hbtn ${i>=0?"sel":""}" onclick="tapHorse(${h.num})">
             ${i>=0 && def.picks>1 && def.ordered && !isBox && !B.boxOn ? `<span class="ord">${i+1}</span>`:""}
             <span class="waku" style="width:22px;height:22px;font-size:13px;background:${WAKU_COLORS[wakuOf(h.num)]};color:${WAKU_TEXT[wakuOf(h.num)]}">${h.num}</span>
-            <span class="hb-name">${h.name.slice(0,5)}</span>
-            <span class="hb-odds num">${h.refOdds.toFixed(1)}</span>
+            <span class="hb-name">${h.pop}人気 ${h.name.slice(0,4)}</span>
+            <span class="hb-odds num">${(def.picks===1 ? oddsOf(B.type,[h.num]) : h.refOdds).toFixed(1)}</span>
           </button>`;
         }).join("")}
       </div>
@@ -643,27 +682,28 @@ function drawBet(){
         ${B.myBets.length ? groupBets(B.myBets).map(g=>{
           const b = g[0];
           if(g.length === 1 && !b.box){
-            const o = provOdds(b.type, b.sel, B.myBets);
             return `<div class="brow">
               <span style="width:56px;font-weight:bold;color:var(--dim);">${BET_TYPES[b.type].label}</span>
               <span style="font-weight:900;">${comboText(b.type,b.sel)}</span>
               <span class="num">${b.units}口</span>
               <span class="num">${yen(b.amount)}</span>
-              <span class="num led" style="font-size:12px;">暫定${o===null?"---":o.toFixed(1)}倍</span>
+              <span class="num led" style="font-size:12px;">${b.odds.toFixed(1)}倍</span>
               <button class="btn btn-sm del" onclick="delBet(${b.gid})">✕</button>
             </div>`;
           }
           const sum = g.reduce((a,x)=>a+x.amount,0);
+          const lo = Math.min(...g.map(x=>x.odds)), hi = Math.max(...g.map(x=>x.odds));
           return `<div class="brow">
             <span style="width:56px;font-weight:bold;color:var(--dim);">${BET_TYPES[b.type].label}</span>
             <span style="font-weight:900;">BOX ${b.boxSel.join("-")}</span>
             <span class="num">${g.length}点×${b.units}口</span>
             <span class="num">${yen(sum)}</span>
+            <span class="num led" style="font-size:12px;">${lo.toFixed(1)}〜${hi.toFixed(1)}倍</span>
             <button class="btn btn-sm del" onclick="delBet(${b.gid})">✕</button>
           </div>`;
         }).join("") : `<div style="color:var(--dim);font-size:13px;">まだ買い目がありません(見送りもOK)</div>`}
       </div>
-      <div class="note">暫定オッズはいまの投票状況での目安。全員の投票後に確定します。</div>
+      <div class="note">オッズは確定値。的中したら 賭け金×オッズ が払い戻されます。</div>
     </div>
     <button class="btn btn-primary btn-wide" onclick="confirmBets()">投票を確定する</button>
   </div>`;
@@ -703,7 +743,7 @@ function addBet(){
   const box = combos.length > 1;
   const boxSel = [...B.sel].sort((a,b)=>a-b);
   combos.forEach(sel => {
-    B.myBets.push({ pid:S.curPlayer, type:B.type, sel, units:B.units, amount:B.units*UNIT, gid, box, boxSel });
+    B.myBets.push({ pid:S.curPlayer, type:B.type, sel, units:B.units, amount:B.units*UNIT, gid, box, boxSel, odds: oddsOf(B.type, sel) });
   });
   B.sel = []; B.units = 1;
   drawBet();
@@ -873,57 +913,61 @@ function showRaceResultOverlay(){
 ===================================================== */
 function renderResult(){
   RACE.anim = null;
-  const info = settle(S.order);
+  const info = settle(S.order, { bets:S.bets, carryIn:S.carry, raceNo:S.raceNo });
+  S.carry = info.carryNext;
   S.lastSettle = info;
-  // 払い戻し・返還を残高に反映
-  S.bets.forEach(b => { S.players[b.pid].money += (b.payout||0) + (b.refund||0); });
+  // 払い戻し・キャリー山分け・返還を残高に反映
+  S.bets.forEach(b => { S.players[b.pid].money += (b.payout||0) + (b.carryBonus||0) + (b.refund||0); });
 
   const top3 = S.order.slice(0,3).map((num,i)=>{
     const h = S.horses.find(x=>x.num===num);
-    return `<div class="res-line" style="padding:3px 0;"><span style="width:52px;color:var(--dim);font-size:14px;">${i+1}着</span>${wakuChip(num)}<span style="font-size:16px;">${h.name}</span></div>`;
+    return `<div class="res-line" style="padding:3px 0;"><span style="width:52px;color:var(--dim);font-size:14px;">${i+1}着</span>${wakuChip(num)}<span style="font-size:16px;">${h.name}</span><span style="font-size:12px;color:var(--dim);">${h.pop}人気</span></div>`;
   }).join("");
 
-  const payRows = TYPE_KEYS.filter(t=>info[t]).map(t=>{
-    const d = info[t], label = BET_TYPES[t].label;
+  const typeRows = TYPE_KEYS.filter(t=>info.types[t]).map(t=>{
+    const d = info.types[t], label = BET_TYPES[t].label;
     if(d.hits.length){
-      const combos = [...new Set(d.hits.map(b=>comboText(b.type,b.sel)))].join(" / ");
+      const seen = new Map();
+      d.hits.forEach(b => { seen.set(comboText(b.type,b.sel), b.odds); });
+      const combos = [...seen.entries()].map(([c,o])=>`${c} <span class="num led">${o.toFixed(1)}倍</span>`).join("　/　");
       return `<div class="pay-row"><span class="pay-type">${label}</span>
-        <span class="pay-combo">${combos}</span>
-        <span class="pay-yen num led">${yen(d.per100)}</span><span style="font-size:11px;color:var(--dim);">/100円</span></div>`;
-    }
-    if(d.carriedNext){
-      return `<div class="pay-row"><span class="pay-type">${label}</span>
-        <span style="color:var(--dim);">的中なし</span>
-        <span class="pay-yen"><span class="carry-badge" style="animation:none;">次レースへ +${yen(d.carriedNext)}</span></span></div>`;
+        <span class="pay-combo" style="min-width:0;">${combos}</span></div>`;
     }
     return `<div class="pay-row"><span class="pay-type">${label}</span>
       <span style="color:var(--dim);">的中なし</span>
-      <span class="pay-yen" style="font-size:13px;color:var(--dim);">${d.refunded ? "購入者に返還" : "プール消滅"}</span></div>`;
+      <span class="pay-yen" style="font-size:13px;"><span class="carry-badge" style="animation:none;">キャリーへ +${yen(d.toPot)}</span></span></div>`;
   }).join("") || `<div style="color:var(--dim);font-size:13px;">このレースの投票はありませんでした</div>`;
+
+  const potRows =
+    (info.potDistributed ? `<div class="pay-row"><span class="pay-type led">山分け</span><span style="font-size:13px;">キャリーオーバー <span class="num led">${yen(info.potDistributed)}</span> を的中者全員に賭け金比で分配</span></div>` : "") +
+    (info.potRefunded ? `<div class="pay-row"><span class="pay-type">返還</span><span style="font-size:13px;color:var(--dim);">最終レースのため残キャリー分を購入者へ返還</span></div>` : "") +
+    (info.carryNext ? `<div class="pay-row"><span class="pay-type">持越し</span><span class="carry-badge">次レースへ +${yen(info.carryNext)}</span></div>` : "");
+  const payRows = typeRows + potRows;
 
   const playerBlocks = S.players.map((p,pi)=>{
     const myBets = S.bets.filter(b=>b.pid===pi);
     const spent = myBets.reduce((a,b)=>a+b.amount,0);
-    const back  = myBets.reduce((a,b)=>a+(b.payout||0)+(b.refund||0),0);
+    const back  = myBets.reduce((a,b)=>a+(b.payout||0)+(b.carryBonus||0)+(b.refund||0),0);
     const diff = back - spent;
     const rows = myBets.length ? groupBets(myBets).map(g=>{
       const b = g[0];
+      const carryTag = (x)=> x.carryBonus ? `<span class="ref-tag" style="background:#3a2606;color:var(--led);">ｷｬﾘｰ+${yen(x.carryBonus)}</span>` : "";
       if(g.length === 1 && !b.box){
-        const tag = b.hit ? `<span class="hit-tag">的中</span>` : (b.refund ? `<span class="ref-tag">返還</span>` : `<span class="miss-tag">はずれ</span>`);
-        const got = (b.payout||0) + (b.refund||0);
-        return `<div class="brow" style="display:flex;gap:8px;padding:4px 0;font-size:13px;align-items:center;">
+        const tag = b.hit ? `<span class="hit-tag">的中 ${b.odds.toFixed(1)}倍</span>` : (b.refund ? `<span class="ref-tag">返還</span>` : `<span class="miss-tag">はずれ</span>`);
+        const got = (b.payout||0) + (b.carryBonus||0) + (b.refund||0);
+        return `<div class="brow" style="display:flex;gap:8px;padding:4px 0;font-size:13px;align-items:center;flex-wrap:wrap;">
           <span style="width:52px;color:var(--dim);font-weight:bold;">${BET_TYPES[b.type].label}</span>
           <span style="font-weight:900;">${comboText(b.type,b.sel)}</span>
-          <span class="num">${yen(b.amount)}</span>${tag}
+          <span class="num">${yen(b.amount)}</span>${tag}${carryTag(b)}
           <span class="num" style="margin-left:auto;">${got ? "+"+yen(got) : ""}</span></div>`;
       }
       const sumG = g.reduce((a,x)=>a+x.amount,0);
-      const gotG = g.reduce((a,x)=>a+(x.payout||0)+(x.refund||0),0);
-      const detail = g.filter(x=>x.hit || x.refund).map(x=>{
-        const tag = x.hit ? `<span class="hit-tag">的中</span>` : `<span class="ref-tag">返還</span>`;
-        return `<div style="display:flex;gap:8px;padding:2px 0 2px 60px;font-size:12px;align-items:center;">
-          <span style="font-weight:900;">${comboText(x.type,x.sel)}</span>${tag}
-          <span class="num" style="margin-left:auto;">+${yen((x.payout||0)+(x.refund||0))}</span></div>`;
+      const gotG = g.reduce((a,x)=>a+(x.payout||0)+(x.carryBonus||0)+(x.refund||0),0);
+      const detail = g.filter(x=>x.hit || x.refund || x.carryBonus).map(x=>{
+        const tag = x.hit ? `<span class="hit-tag">的中 ${x.odds.toFixed(1)}倍</span>` : (x.refund ? `<span class="ref-tag">返還</span>` : "");
+        return `<div style="display:flex;gap:8px;padding:2px 0 2px 60px;font-size:12px;align-items:center;flex-wrap:wrap;">
+          <span style="font-weight:900;">${comboText(x.type,x.sel)}</span>${tag}${carryTag(x)}
+          <span class="num" style="margin-left:auto;">+${yen((x.payout||0)+(x.carryBonus||0)+(x.refund||0))}</span></div>`;
       }).join("");
       return `<div style="padding:4px 0;border-bottom:1px solid #1a2742;">
         <div style="display:flex;gap:8px;font-size:13px;align-items:center;">
@@ -990,41 +1034,39 @@ function renderFinal(){
 ===================================================== */
 function __testPayout(){
   const eq = (a,b,msg) => console.log((JSON.stringify(a)===JSON.stringify(b) ? "OK " : "NG ") + msg, a, b);
-  // 単勝: 2人が別の馬を購入 → 的中者総取り
-  let bets = [
-    {pid:0,type:"tansho",sel:[1],units:2,amount:200},
-    {pid:1,type:"tansho",sel:[2],units:1,amount:100},
-  ];
-  settle([1,2,3], {bets, carry:{}, raceNo:1});
-  eq(bets[0].payout, 300, "単勝: プール300を的中者が総取り");
-  eq(bets[1].payout, 0,   "単勝: はずれは0");
-  // 山分け: 同じ的中に2人 → 賭け金比で按分
+  // 的中 = 賭け金×オッズ
+  let bets = [{pid:0,type:"tansho",sel:[1],units:2,amount:200,odds:3.5,gid:1}];
+  let info = settle([1,2,3], {bets, carryIn:0, raceNo:1});
+  eq(bets[0].payout, 700, "単勝3.5倍×200円=700円");
+  eq(info.carryNext, 0, "的中ありの券種はキャリーなし");
+  // 的中ゼロ券種は券種を問わず共通キャリーへ合算
   bets = [
-    {pid:0,type:"umaren",sel:[1,2],units:1,amount:100},
-    {pid:1,type:"umaren",sel:[2,1],units:3,amount:300},
-    {pid:1,type:"umaren",sel:[3,4],units:6,amount:600},
+    {pid:0,type:"tansho",sel:[9],units:1,amount:100,odds:5,gid:1},
+    {pid:1,type:"sanrentan",sel:[9,8,7],units:3,amount:300,odds:120,gid:2},
   ];
-  settle([2,1,5], {bets, carry:{}, raceNo:1});
-  eq(bets[0].payout, 250, "馬連: 1000×100/400=250");
-  eq(bets[1].payout, 750, "馬連: 1000×300/400=750");
-  // キャリーオーバー
-  bets = [{pid:0,type:"sanrentan",sel:[1,2,3],units:1,amount:100}];
-  const carry = {sanrentan:0};
-  settle([4,5,6], {bets, carry, raceNo:1});
-  eq(carry.sanrentan, 100, "三連単: 的中なし→次レースへ持ち越し");
-  // キャリー加算後の的中
-  bets = [{pid:0,type:"sanrentan",sel:[1,2,3],units:1,amount:100}];
-  settle([1,2,3], {bets, carry, raceNo:2});
-  eq(bets[0].payout, 200, "三連単: キャリー100+購入100=200を払い戻し");
-  eq(carry.sanrentan, 0, "キャリーはリセット");
-  // 3R目で的中なし→購入者に返還
+  info = settle([1,2,3], {bets, carryIn:0, raceNo:1});
+  eq(info.carryNext, 400, "全ハズレ: 単勝100+三連単300=400が共通キャリーへ");
+  // キャリー山分け: 券種問わず的中者全員に賭け金比
   bets = [
-    {pid:0,type:"wide",sel:[1,2],units:1,amount:100},
-    {pid:1,type:"wide",sel:[1,3],units:3,amount:300},
+    {pid:0,type:"tansho",sel:[1],units:1,amount:100,odds:2.0,gid:1},
+    {pid:1,type:"fukusho",sel:[2],units:3,amount:300,odds:1.5,gid:2},
+    {pid:1,type:"umaren",sel:[8,9],units:1,amount:100,odds:10,gid:3},
   ];
-  settle([7,8,9], {bets, carry:{wide:400}, raceNo:3});
-  eq(bets[0].refund, 200, "ワイド3R目: 800×100/400=200返還");
-  eq(bets[1].refund, 600, "ワイド3R目: 800×300/400=600返還");
+  info = settle([1,2,3], {bets, carryIn:400, raceNo:2});
+  eq(bets[0].payout, 200, "単勝: 100×2.0=200");
+  eq(bets[0].carryBonus, 100, "キャリー分配: 400×100/400=100");
+  eq(bets[1].carryBonus, 300, "キャリー分配: 400×300/400=300");
+  eq(info.potDistributed, 400, "キャリー400を分配済み");
+  eq(info.carryNext, 100, "ハズレ馬連100は新たなキャリーへ");
+  // 3R目で的中者ゼロ: 残キャリーを購入者へ比例返還
+  bets = [
+    {pid:0,type:"wide",sel:[1,9],units:1,amount:100,odds:3,gid:1},
+    {pid:1,type:"wide",sel:[8,9],units:3,amount:300,odds:4,gid:2},
+  ];
+  info = settle([1,2,3], {bets, carryIn:400, raceNo:3});
+  eq(bets[0].refund, 200, "3R目全ハズレ: (キャリー400+今回400)×100/400=200返還");
+  eq(bets[1].refund, 600, "3R目全ハズレ: 800×300/400=600返還");
+  eq(info.carryNext, 0, "3R目終了時キャリーは残らない");
   console.log("テスト完了");
 }
 
